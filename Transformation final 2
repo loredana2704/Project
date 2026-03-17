@@ -1,0 +1,355 @@
+import psycopg
+import pandas as pd
+
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_USER = "postgres"
+DB_PASSWORD = "xxxx"
+TARGET_DB = "DWH"
+SOURCE_SCHEMA = "ingestion"
+TARGET_SCHEMA = "transformation"
+
+
+def get_connection(db_name):
+    return psycopg.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=db_name,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+
+
+def load_table(query):
+    conn = get_connection(TARGET_DB)
+
+    try:
+        df = pd.read_sql_query(sql=query, con=conn)
+        return df
+    finally:
+        conn.close()
+
+
+def insert_dataframe(table_name, df):
+    conn = get_connection(TARGET_DB)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE TABLE {TARGET_SCHEMA}.{table_name};")
+
+            columns = list(df.columns)
+            column_names = ", ".join(columns)
+            placeholders = ", ".join(["%s"] * len(columns))
+
+            insert_sql = f"""
+                INSERT INTO {TARGET_SCHEMA}.{table_name} ({column_names})
+                VALUES ({placeholders})
+            """
+
+            for row in df.itertuples(index=False, name=None):
+                cur.execute(insert_sql, row)
+
+        conn.commit()
+        print(f"{table_name} transformed and loaded")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error while loading {table_name}:")
+        print(e)
+
+    finally:
+        conn.close()
+
+
+def transform_crm_customer():
+    query = f"SELECT * FROM {SOURCE_SCHEMA}.crm_cust_info"
+    df = load_table(query)
+
+    df = df.dropna(subset=["cst_id"])
+    df = df.drop_duplicates(subset=["cst_id"], keep="last").copy()
+
+    df["cst_key"] = df["cst_key"].astype(str).str.strip()
+    df["cst_firstname"] = df["cst_firstname"].astype(str).str.strip()
+    df["cst_lastname"] = df["cst_lastname"].astype(str).str.strip()
+    df["cst_marital_status"] = df["cst_marital_status"].astype(str).str.strip()
+    df["cst_gndr"] = df["cst_gndr"].astype(str).str.strip()
+
+    df["cst_firstname"] = df["cst_firstname"].replace("", pd.NA)
+    df["cst_lastname"] = df["cst_lastname"].replace("", pd.NA)
+
+    df["cst_marital_status"] = df["cst_marital_status"].replace({
+        "S": "Single",
+        "SINGLE": "Single",
+        "M": "Married",
+        "MARRIED": "Married",
+        "": pd.NA
+    })
+    df["cst_marital_status"] = df["cst_marital_status"].fillna("N/A")
+
+    df["cst_gndr"] = df["cst_gndr"].str.upper().replace({
+        "M": "Male",
+        "MALE": "Male",
+        "F": "Female",
+        "FEMALE": "Female",
+        "": pd.NA
+    })
+    df["cst_gndr"] = df["cst_gndr"].fillna("N/A")
+
+    df["cst_create_date"] = df["cst_create_date"].astype(str).str.strip()
+
+    df = df.rename(columns={
+        "cst_id": "id",
+        "cst_key": "customer_key",
+        "cst_firstname": "first_name",
+        "cst_lastname": "last_name",
+        "cst_marital_status": "marital_status",
+        "cst_gndr": "gender",
+        "cst_create_date": "date_of_creation"
+    })
+
+    df = df[[
+        "id",
+        "customer_key",
+        "first_name",
+        "last_name",
+        "marital_status",
+        "gender",
+        "date_of_creation"
+    ]]
+
+    insert_dataframe("crm_customer", df)
+
+
+def transform_crm_product():
+    query = f"SELECT * FROM {SOURCE_SCHEMA}.crm_prd_info"
+    df = load_table(query)
+
+    df = df.dropna(subset=["prd_id"])
+    df = df.drop_duplicates(subset=["prd_id"], keep="last").copy()
+
+    df["prd_key"] = df["prd_key"].astype(str).str.strip()
+    df["prd_nm"] = df["prd_nm"].astype(str).str.strip().replace("", pd.NA)
+    df["prd_line"] = df["prd_line"].astype(str).str.strip().str.upper()
+
+    df["prd_cost"] = pd.to_numeric(df["prd_cost"], errors="coerce")
+    df.loc[df["prd_cost"] < 0, "prd_cost"] = pd.NA
+
+    df["prd_start_dt"] = pd.to_datetime(df["prd_start_dt"], errors="coerce")
+    df["prd_end_dt"] = pd.to_datetime(df["prd_end_dt"], errors="coerce")
+
+    df.loc[df["prd_end_dt"] < df["prd_start_dt"], "prd_end_dt"] = pd.NaT
+
+    df = df.sort_values(by=["prd_id"]).copy()
+
+    df["prd_start_dt"] = df["prd_start_dt"].dt.strftime("%Y-%m-%d")
+    df["prd_end_dt"] = df["prd_end_dt"].dt.strftime("%Y-%m-%d")
+
+    df = df.rename(columns={
+        "prd_id": "id",
+        "prd_key": "product_key",
+        "prd_nm": "product_name",
+        "prd_cost": "product_cost",
+        "prd_line": "product_line",
+        "prd_start_dt": "product_start_date",
+        "prd_end_dt": "product_end_date"
+    })
+
+    df["product_cost"] = df["product_cost"].astype("string")
+    df["product_start_date"] = df["product_start_date"].astype("string")
+    df["product_end_date"] = df["product_end_date"].astype("string")
+
+    df = df[[
+        "id",
+        "product_key",
+        "product_name",
+        "product_cost",
+        "product_line",
+        "product_start_date",
+        "product_end_date"
+    ]]
+
+    insert_dataframe("crm_product", df)
+
+
+def transform_crm_sales():
+    query = f"SELECT * FROM {SOURCE_SCHEMA}.crm_sales_details"
+    df = load_table(query)
+
+    df = df.dropna(subset=["sls_ord_num"])
+    df = df.drop_duplicates(subset=["sls_ord_num"], keep="last").copy()
+
+    df["sls_ord_num"] = df["sls_ord_num"].astype(str).str.strip()
+    df["sls_prd_key"] = df["sls_prd_key"].astype(str).str.strip()
+    df["sls_cust_id"] = df["sls_cust_id"].astype(str).str.strip()
+
+    df["sls_order_dt"] = pd.to_datetime(df["sls_order_dt"], errors="coerce")
+    df["sls_ship_dt"] = pd.to_datetime(df["sls_ship_dt"], errors="coerce")
+    df["sls_due_dt"] = pd.to_datetime(df["sls_due_dt"], errors="coerce")
+
+    df.loc[df["sls_order_dt"] > df["sls_ship_dt"], "sls_order_dt"] = pd.NaT
+    df.loc[df["sls_due_dt"] < df["sls_ship_dt"], "sls_due_dt"] = pd.NaT
+
+    df["sls_order_dt"] = df.groupby("sls_ord_num")["sls_order_dt"].transform("min")
+
+    df["sls_sales"] = pd.to_numeric(df["sls_sales"], errors="coerce")
+    df["sls_quantity"] = pd.to_numeric(df["sls_quantity"], errors="coerce")
+    df["sls_price"] = pd.to_numeric(df["sls_price"], errors="coerce")
+
+    mask_fix_sales = ((df["sls_sales"] <= 0) | (df["sls_sales"].isna())) & (df["sls_price"] > 0)
+    df.loc[mask_fix_sales, "sls_sales"] = df["sls_price"]
+
+    mask_fix_price = ((df["sls_price"] <= 0) | (df["sls_price"].isna())) & (df["sls_sales"] > 0)
+    df.loc[mask_fix_price, "sls_price"] = df["sls_sales"]
+
+    df.loc[df["sls_quantity"] < 0, "sls_quantity"] = pd.NA
+
+    df["sls_order_dt"] = df["sls_order_dt"].dt.strftime("%Y-%m-%d")
+    df["sls_ship_dt"] = df["sls_ship_dt"].dt.strftime("%Y-%m-%d")
+    df["sls_due_dt"] = df["sls_due_dt"].dt.strftime("%Y-%m-%d")
+
+    df = df.rename(columns={
+        "sls_ord_num": "id",
+        "sls_prd_key": "product_key",
+        "sls_cust_id": "customer_id",
+        "sls_order_dt": "order_date",
+        "sls_ship_dt": "shipping_date",
+        "sls_due_dt": "due_date",
+        "sls_sales": "sale_amount",
+        "sls_quantity": "quantity",
+        "sls_price": "price"
+    })
+
+    df["sale_amount"] = df["sale_amount"].astype("string")
+    df["quantity"] = df["quantity"].astype("string")
+    df["price"] = df["price"].astype("string")
+
+    df = df[[
+        "id",
+        "product_key",
+        "customer_id",
+        "order_date",
+        "shipping_date",
+        "due_date",
+        "sale_amount",
+        "quantity",
+        "price"
+    ]]
+
+    insert_dataframe("crm_sales", df)
+
+
+def transform_erp_customer():
+    query = f"SELECT * FROM {SOURCE_SCHEMA}.erp_cust_az12"
+    df = load_table(query)
+
+    df = df.dropna(subset=["cid"])
+    df = df.drop_duplicates(subset=["cid"], keep="last").copy()
+
+    df["cid"] = df["cid"].astype(str).str.strip()
+    df["gen"] = df["gen"].astype(str).str.strip()
+
+    df["gen"] = df["gen"].str.upper().replace({
+        "M": "Male",
+        "F": "Female",
+        "": pd.NA
+    })
+    df["gen"] = df["gen"].fillna("N/A")
+
+    df["bdate"] = pd.to_datetime(df["bdate"], errors="coerce")
+    df.loc[df["bdate"] > pd.Timestamp.today().normalize(), "bdate"] = pd.NaT
+    df["bdate"] = df["bdate"].dt.strftime("%Y-%m-%d")
+
+    df = df.rename(columns={
+        "cid": "id",
+        "bdate": "date_of_birth",
+        "gen": "gender"
+    })
+
+    df = df[[
+        "id",
+        "date_of_birth",
+        "gender"
+    ]]
+
+    insert_dataframe("erp_customer", df)
+
+
+def transform_erp_location():
+    query = f"SELECT * FROM {SOURCE_SCHEMA}.erp_loc_a101"
+    df = load_table(query)
+
+    df = df.dropna(subset=["cid"])
+    df = df.drop_duplicates(subset=["cid"], keep="last").copy()
+
+    df["cid"] = df["cid"].astype(str).str.strip()
+    df["cntry"] = df["cntry"].astype(str).str.strip()
+
+    df["cntry"] = df["cntry"].replace({
+        "DE": "Germany",
+        "US": "United States of America",
+        "USA": "United States of America",
+        "United States": "United States of America",
+        "": pd.NA
+    })
+    df["cntry"] = df["cntry"].fillna("N/A")
+
+    df = df.rename(columns={
+        "cid": "id",
+        "cntry": "country"
+    })
+
+    df = df[[
+        "id",
+        "country"
+    ]]
+
+    insert_dataframe("erp_location", df)
+
+
+def transform_erp_product_category():
+    query = f"SELECT * FROM {SOURCE_SCHEMA}.erp_px_cat_g1v2"
+    df = load_table(query)
+
+    df = df.dropna(subset=["id"])
+    df = df.drop_duplicates(subset=["id"], keep="last").copy()
+
+    df["id"] = df["id"].astype(str).str.strip()
+    df["cat"] = df["cat"].astype(str).str.strip().replace("", pd.NA)
+    df["subcat"] = df["subcat"].astype(str).str.strip().replace("", pd.NA)
+    df["maintenance"] = df["maintenance"].astype(str).str.strip()
+
+    df["maintenance"] = df["maintenance"].str.upper().replace({
+        "YES": "1",
+        "NO": "0",
+        "": pd.NA
+    })
+
+    df = df.rename(columns={
+        "id": "id",
+        "cat": "category",
+        "subcat": "subcategory",
+        "maintenance": "requires_maintenance"
+    })
+
+    df = df[[
+        "id",
+        "category",
+        "subcategory",
+        "requires_maintenance"
+    ]]
+
+    insert_dataframe("erp_product_category", df)
+
+
+def main():
+    transform_crm_customer()
+    transform_crm_product()
+    transform_crm_sales()
+    transform_erp_customer()
+    transform_erp_location()
+    transform_erp_product_category()
+    print("All transformation tables loaded successfully")
+
+
+if __name__ == "__main__":
+    main()

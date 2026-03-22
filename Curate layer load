@@ -1,0 +1,184 @@
+import psycopg
+import pandas as pd
+
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_USER = "postgres"
+DB_PASSWORD = "xxxx"
+TARGET_DB = "DWH"
+SOURCE_SCHEMA = "transformation"
+CURATED_SCHEMA = "curated"
+
+
+def get_connection(db_name):
+    return psycopg.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=db_name,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+
+
+def read_table(table_name, schema_name=SOURCE_SCHEMA):
+    conn = get_connection(TARGET_DB)
+
+    try:
+        query = f"SELECT * FROM {schema_name}.{table_name}"
+        return pd.read_sql_query(query, conn)
+    finally:
+        conn.close()
+
+
+def write_table(table_name, df):
+    conn = get_connection(TARGET_DB)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE TABLE {CURATED_SCHEMA}.{table_name};")
+
+            columns = list(df.columns)
+            column_sql = ", ".join(columns)
+            placeholder_sql = ", ".join(["%s"] * len(columns))
+
+            insert_sql = f"""
+                INSERT INTO {CURATED_SCHEMA}.{table_name} ({column_sql})
+                VALUES ({placeholder_sql})
+            """
+
+            clean_df = df.astype(object).where(pd.notnull(df), None)
+
+            for row in clean_df.itertuples(index=False, name=None):
+                cur.execute(insert_sql, row)
+
+        conn.commit()
+        print(f"{table_name} loaded into schema '{CURATED_SCHEMA}'")
+
+    except Exception as e:
+        conn.rollback()
+        print(f"Error while loading {table_name}:")
+        print(e)
+
+    finally:
+        conn.close()
+
+
+def build_dim_customers():
+    crm_customers = read_table("crm_customer")
+    erp_customers = read_table("erp_customer")
+    erp_locations = read_table("erp_location")
+
+    crm_customers["id"] = crm_customers["id"].astype(str).str.strip()
+    erp_customers["id"] = erp_customers["id"].astype(str).str.strip()
+    erp_locations["id"] = erp_locations["id"].astype(str).str.strip()
+
+    customer_base = crm_customers.merge(
+        erp_customers,
+        how="left",
+        on="id",
+        suffixes=("", "_erp")
+    )
+
+    customer_base = customer_base.merge(
+        erp_locations,
+        how="left",
+        on="id"
+    )
+
+    dim_customers = pd.DataFrame({
+        "customer_id": customer_base["id"],
+        "customer_number": customer_base["customer_key"],
+        "first_name": customer_base["first_name"],
+        "last_name": customer_base["last_name"],
+        "country": customer_base["country"],
+        "marital_status": customer_base["marital_status"],
+        "gender": customer_base["gender"],
+        "birthdate": customer_base["date_of_birth"],
+        "create_date": customer_base["date_of_creation"]
+    })
+
+    dim_customers = dim_customers.sort_values(by=["customer_id"]).reset_index(drop=True)
+    dim_customers.insert(0, "customer_key", range(1, len(dim_customers) + 1))
+
+    write_table("dim_customers", dim_customers)
+
+
+def build_dim_products():
+    crm_products = read_table("crm_product")
+    erp_categories = read_table("erp_product_category")
+
+    crm_products["id"] = crm_products["id"].astype(str).str.strip()
+    crm_products["product_key"] = crm_products["product_key"].astype(str).str.strip()
+    erp_categories["id"] = erp_categories["id"].astype(str).str.strip()
+
+    dim_products = pd.DataFrame({
+        "product_id": crm_products["id"],
+        "product_number": crm_products["product_key"],
+        "product_name": crm_products["product_name"],
+        "category_id": pd.NA,
+        "category": pd.NA,
+        "subcategory": pd.NA,
+        "maintenance": pd.NA,
+        "cost": crm_products["product_cost"],
+        "product_line": crm_products["product_line"],
+        "start_date": crm_products["product_start_date"],
+        "end_date": crm_products["product_end_date"]
+    })
+
+    dim_products = dim_products.sort_values(by=["product_number"]).reset_index(drop=True)
+    dim_products.insert(0, "product_key", range(1, len(dim_products) + 1))
+
+    write_table("dim_products", dim_products)
+
+
+def build_fact_sales():
+    sales = read_table("crm_sales")
+    dim_customers = read_table("dim_customers", schema_name=CURATED_SCHEMA)
+    dim_products = read_table("dim_products", schema_name=CURATED_SCHEMA)
+
+    sales["product_key"] = sales["product_key"].astype(str).str.strip()
+    sales["customer_id"] = sales["customer_id"].astype(str).str.strip()
+
+    dim_products["product_number"] = dim_products["product_number"].astype(str).str.strip()
+    dim_customers["customer_id"] = dim_customers["customer_id"].astype(str).str.strip()
+
+    sales_with_products = sales.merge(
+        dim_products[["product_key", "product_number"]],
+        how="left",
+        left_on="product_key",
+        right_on="product_number",
+        suffixes=("", "_dim")
+    )
+
+    sales_final = sales_with_products.merge(
+        dim_customers[["customer_key", "customer_id"]],
+        how="left",
+        on="customer_id"
+    )
+
+    fact_sales = pd.DataFrame({
+        "product_key": sales_final["product_key_dim"],
+        "customer_key": sales_final["customer_key"],
+        "order_number": sales_final["id"],
+        "order_date": sales_final["order_date"],
+        "shipping_date": sales_final["shipping_date"],
+        "due_date": sales_final["due_date"],
+        "sales_amount": sales_final["sale_amount"],
+        "quantity": sales_final["quantity"],
+        "price": sales_final["price"]
+    })
+
+    fact_sales.insert(0, "sales_key", range(1, len(fact_sales) + 1))
+
+    write_table("fact_sales", fact_sales)
+
+
+def main():
+    build_dim_customers()
+    build_dim_products()
+    build_fact_sales()
+    print("Curated layer loaded successfully")
+
+
+if __name__ == "__main__":
+    main()

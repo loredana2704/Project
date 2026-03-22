@@ -1,0 +1,113 @@
+import psycopg
+from psycopg import sql
+
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_USER = "postgres"
+DB_PASSWORD = "xxxx"
+TARGET_DB = "DWH"
+CURATED_SCHEMA = "curated"
+
+
+def get_connection(db_name):
+    return psycopg.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=db_name,
+        user=DB_USER,
+        password=DB_PASSWORD
+    )
+
+
+def create_curated_schema():
+    conn = get_connection(TARGET_DB)
+    conn.autocommit = True
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(CURATED_SCHEMA))
+            )
+            print(f"Schema '{CURATED_SCHEMA}' created successfully")
+    finally:
+        conn.close()
+
+
+def create_curated_tables():
+    conn = get_connection(TARGET_DB)
+
+    dim_customers_sql = """
+        CREATE TABLE IF NOT EXISTS curated.dim_customers (
+            customer_key INT,
+            customer_id VARCHAR(50),
+            customer_number VARCHAR(50),
+            first_name VARCHAR(50),
+            last_name VARCHAR(50),
+            country VARCHAR(50),
+            marital_status VARCHAR(20),
+            gender VARCHAR(20),
+            birthdate VARCHAR(20),
+            create_date VARCHAR(50)
+        );
+    """
+
+    dim_products_sql = """
+        CREATE TABLE IF NOT EXISTS curated.dim_products (
+            product_key INT,
+            product_id VARCHAR(50),
+            product_number VARCHAR(50),
+            product_name VARCHAR(100),
+            category_id VARCHAR(50),
+            category VARCHAR(100),
+            subcategory VARCHAR(100),
+            maintenance VARCHAR(50),
+            cost VARCHAR(20),
+            product_line VARCHAR(20),
+            start_date VARCHAR(20),
+            end_date VARCHAR(20)
+        );
+    """
+
+    fact_sales_sql = """
+        CREATE TABLE IF NOT EXISTS curated.fact_sales (
+            sales_key INT,
+            product_key INT,
+            customer_key INT,
+            order_number VARCHAR(50),
+            order_date VARCHAR(50),
+            shipping_date VARCHAR(50),
+            due_date VARCHAR(50),
+            sales_amount VARCHAR(50),
+            quantity VARCHAR(50),
+            price VARCHAR(20)
+        );
+    """
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(CURATED_SCHEMA))
+            )
+            cur.execute(
+                sql.SQL("SET search_path TO {}").format(sql.Identifier(CURATED_SCHEMA))
+            )
+
+            cur.execute(dim_customers_sql)
+            cur.execute(dim_products_sql)
+            cur.execute(fact_sales_sql)
+
+        conn.commit()
+        print(f"Curated tables created successfully in schema '{CURATED_SCHEMA}'")
+
+    except Exception as e:
+        conn.rollback()
+        print("Error while creating curated tables:")
+        print(e)
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    create_curated_schema()
+    create_curated_tables()
